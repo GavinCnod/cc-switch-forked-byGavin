@@ -1,6 +1,8 @@
 //! OpenCode 会话日志使用追踪
 //!
 //! 从 ~/.local/share/opencode/opencode.db (SQLite) 中提取精确 token 使用数据。
+//! Windows 上如果配置目录指向 WSL，数据目录会从 WSL home 推导，SQLite 通过
+//! `session_manager::opencode_wsl` 在发行版内只读访问（9P 共享没有 SQLite 所需的锁）。
 //!
 //! ## 数据流
 //! ```text
@@ -25,8 +27,11 @@ use crate::services::session_usage::{
 };
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
+#[cfg(windows)]
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::time::SystemTime;
 
 /// 从 opencode message.data JSON 中提取的 token 和费用数据
@@ -83,6 +88,140 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
     .map_err(|error| AppError::Database(format!("查询表 {table} 失败: {error}")))
 }
 
+impl OpenCodeSchema {
+    #[cfg(windows)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    #[cfg(windows)]
+    fn parse(value: &str) -> Result<Self, AppError> {
+        match value {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            "mixed" => Ok(Self::Mixed),
+            other => Err(AppError::Database(format!(
+                "Unknown OpenCode schema from WSL reader: {other}"
+            ))),
+        }
+    }
+}
+
+/// A database opened either natively or through the WSL reader.
+///
+/// Only the access path differs; schema detection, row filtering, parsing and
+/// all cursor/cost logic stay in this module.
+enum OpenCodeDatabase {
+    Native(rusqlite::Connection),
+    #[cfg(windows)]
+    Wsl(std::path::PathBuf),
+}
+
+impl OpenCodeDatabase {
+    fn schema(&self) -> Result<OpenCodeSchema, AppError> {
+        match self {
+            Self::Native(conn) => detect_schema(conn),
+            #[cfg(windows)]
+            Self::Wsl(path) => {
+                let value = crate::session_manager::opencode_wsl::read(
+                    path,
+                    serde_json::json!({ "operation": "schema", "scope": "usage" }),
+                )
+                .map_err(AppError::Database)?;
+                let schema = value
+                    .as_str()
+                    .ok_or_else(|| AppError::Database("Invalid OpenCode WSL schema".into()))?;
+                OpenCodeSchema::parse(schema)
+            }
+        }
+    }
+
+    fn sessions(&self, schema: OpenCodeSchema) -> Result<Vec<(String, i64)>, AppError> {
+        match self {
+            Self::Native(conn) => query_sessions(conn, schema),
+            #[cfg(windows)]
+            Self::Wsl(path) => {
+                let value = crate::session_manager::opencode_wsl::read(
+                    path,
+                    serde_json::json!({ "operation": "usage_sessions" }),
+                )
+                .map_err(AppError::Database)?;
+                let rows = value
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::Database("Invalid OpenCode WSL session response".into())
+                    })?;
+                rows.iter()
+                    .map(|row| {
+                        let id = row.get("id").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::Database("OpenCode WSL session without id".into())
+                        })?;
+                        let watermark = row
+                            .get("sync_watermark")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(|| {
+                                AppError::Database("OpenCode WSL session without watermark".into())
+                            })?;
+                        Ok((id.to_string(), watermark))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn messages(
+        &self,
+        schema: OpenCodeSchema,
+        session_id: &str,
+        mixed_cutoff_ms: i64,
+    ) -> Result<OpenCodeMessageQueryResult, AppError> {
+        let rows = match self {
+            Self::Native(conn) => query_message_rows(conn, schema, session_id, mixed_cutoff_ms)?,
+            #[cfg(windows)]
+            Self::Wsl(path) => {
+                let value = crate::session_manager::opencode_wsl::read(
+                    path,
+                    serde_json::json!({
+                        "operation": "usage_messages",
+                        "schema": schema.as_str(),
+                        "session_id": session_id,
+                        "cutoff_ms": mixed_cutoff_ms,
+                    }),
+                )
+                .map_err(AppError::Database)?;
+                let rows = value
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::Database("Invalid OpenCode WSL message response".into())
+                    })?;
+                rows.iter()
+                    .map(|row| {
+                        let id = row.get("id").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::Database("OpenCode WSL message without id".into())
+                        })?;
+                        let data = row.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::Database("OpenCode WSL message without data".into())
+                        })?;
+                        let message_type = row.get("type").and_then(Value::as_str);
+                        Ok((
+                            id.to_string(),
+                            data.to_string(),
+                            message_type.map(str::to_string),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()?
+            }
+        };
+        Ok(parse_message_rows(rows))
+    }
+}
+
 /// 同步 OpenCode 使用数据
 pub(crate) fn sync_opencode_usage(
     db: &Database,
@@ -108,15 +247,28 @@ fn sync_opencode_usage_from_path_with_cursors(
     db_path: &std::path::Path,
     cursors: &crate::services::session_usage::SyncCursors,
 ) -> Result<SessionSyncResult, AppError> {
+    let empty_result = || SessionSyncResult {
+        imported: 0,
+        skipped: 0,
+        files_scanned: 0,
+        suspected_duplicates: 0,
+        deferred_files: 0,
+        errors: vec![],
+    };
+
+    // Do not wake a stopped WSL distribution just because the background usage
+    // sync runs every ten minutes. File metadata lookups on \\wsl.localhost
+    // already start the distro through the 9P redirector.
+    #[cfg(windows)]
+    if let Some(distro) = crate::session_manager::opencode_wsl::distro(db_path) {
+        if !crate::session_manager::opencode_wsl::distro_running(&distro) {
+            log::debug!("OpenCode usage sync skipped: WSL distro '{distro}' is not running");
+            return Ok(empty_result());
+        }
+    }
+
     if !db_path.exists() {
-        return Ok(SessionSyncResult {
-            imported: 0,
-            skipped: 0,
-            files_scanned: 0,
-            suspected_duplicates: 0,
-            deferred_files: 0,
-            errors: vec![],
-        });
+        return Ok(empty_result());
     }
 
     let db_path_str = db_path.to_string_lossy().to_string();
@@ -134,11 +286,11 @@ fn sync_opencode_usage_from_path_with_cursors(
         file_modified = file_modified.max(metadata_modified_nanos(&wal_meta));
     }
 
-    // 打开 opencode 的 SQLite 数据库（只读）
-    let opencode_conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| AppError::Database(format!("无法打开 opencode.db: {e}")))?;
-    let schema = detect_schema(&opencode_conn)?;
+    // 打开 opencode 的 SQLite 数据库（只读）。WSL 路径必须交给 WSL
+    // reader：Windows 的 9P 共享没有 SQLite 需要的字节范围锁，直接打开
+    // 可能报 database is locked，且 WAL 中的新数据不一定可见。
+    let opencode_db = open_opencode_database(db_path)?;
+    let schema = opencode_db.schema()?;
 
     // 混合布局只统计起点之后更新的消息（毫秒，与 time_updated 同单位）：
     // 不回填旧版本漏算的历史，也避免明细已汇总删除的旧消息被重新导入而重复计数。
@@ -189,7 +341,7 @@ fn sync_opencode_usage_from_path_with_cursors(
     let mut has_sync_errors = false;
 
     // 查询所有会话
-    let sessions = query_sessions(&opencode_conn, schema)?;
+    let sessions = opencode_db.sessions(schema)?;
 
     for (session_id, time_updated) in &sessions {
         // 检查会话是否需要重新同步
@@ -206,7 +358,7 @@ fn sync_opencode_usage_from_path_with_cursors(
 
         // 查询该会话的所有 assistant 消息
         let mut session_has_incomplete_usage = false;
-        match query_assistant_messages(&opencode_conn, schema, session_id, mixed_cutoff_ms) {
+        match opencode_db.messages(schema, session_id, mixed_cutoff_ms) {
             Ok(query_result) => {
                 session_has_incomplete_usage = query_result.has_incomplete_usage;
                 for (message_id, msg_data) in &query_result.messages {
@@ -268,6 +420,17 @@ fn sync_opencode_usage_from_path_with_cursors(
     Ok(result)
 }
 
+fn open_opencode_database(db_path: &Path) -> Result<OpenCodeDatabase, AppError> {
+    #[cfg(windows)]
+    if crate::session_manager::opencode_wsl::is_wsl(db_path) {
+        return Ok(OpenCodeDatabase::Wsl(db_path.to_path_buf()));
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| AppError::Database(format!("无法打开 opencode.db: {e}")))?;
+    Ok(OpenCodeDatabase::Native(conn))
+}
+
 /// 查询所有会话的 (id, sync_watermark)
 fn query_sessions(
     conn: &rusqlite::Connection,
@@ -319,12 +482,12 @@ fn query_sessions(
 ///
 /// `mixed_cutoff_ms` 仅对混合布局生效：只返回该时间之后更新的消息。起点时
 /// 尚未完成的消息完成时会刷新 time_updated，因此仍会被采到。
-fn query_assistant_messages(
+fn query_message_rows(
     conn: &rusqlite::Connection,
     schema: OpenCodeSchema,
     session_id: &str,
     mixed_cutoff_ms: i64,
-) -> Result<OpenCodeMessageQueryResult, AppError> {
+) -> Result<Vec<(String, String, Option<String>)>, AppError> {
     // V2 的消息类型记录在 `type` 列上，上下文压缩请求的用量写在
     // type='compaction' 行（V1 中压缩摘要是 assistant 消息，无需特判）；
     // V1 需要按 data.role 过滤。
@@ -369,12 +532,18 @@ fn query_assistant_messages(
         })
         .map_err(|e| AppError::Database(format!("查询消息失败: {e}")))?;
 
+    rows.map(|row| row.map_err(|e| AppError::Database(format!("读取消息行失败: {e}"))))
+        .collect()
+}
+
+fn parse_message_rows<I>(rows: I) -> OpenCodeMessageQueryResult
+where
+    I: IntoIterator<Item = (String, String, Option<String>)>,
+{
     let mut messages = Vec::new();
     let mut has_incomplete_usage = false;
     let mut seen = HashSet::new();
-    for row in rows {
-        let (message_id, data_json, message_type) =
-            row.map_err(|e| AppError::Database(format!("读取消息行失败: {e}")))?;
+    for (message_id, data_json, message_type) in rows {
         if !seen.insert(message_id.clone()) {
             continue;
         }
@@ -417,10 +586,25 @@ fn query_assistant_messages(
         }
     }
 
-    Ok(OpenCodeMessageQueryResult {
+    OpenCodeMessageQueryResult {
         messages,
         has_incomplete_usage,
-    })
+    }
+}
+
+#[cfg(test)]
+fn query_assistant_messages(
+    conn: &rusqlite::Connection,
+    schema: OpenCodeSchema,
+    session_id: &str,
+    mixed_cutoff_ms: i64,
+) -> Result<OpenCodeMessageQueryResult, AppError> {
+    Ok(parse_message_rows(query_message_rows(
+        conn,
+        schema,
+        session_id,
+        mixed_cutoff_ms,
+    )?))
 }
 
 /// 解析 opencode message.data JSON 为结构化数据
@@ -1380,5 +1564,73 @@ mod tests {
         assert_eq!(result.messages[0].1.model_id, "deepseek-v4.1-flash");
         assert_eq!(result.messages[1].1.input_tokens, 300);
         assert!(result.has_incomplete_usage);
+    }
+
+    /// Diagnostic reference only: requires a real Windows host and WSL2 distro.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn wsl2_live_usage_reference() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        let distro = std::env::var("CC_SWITCH_WSL_DISTRO").expect("WSL distro");
+        let native_path = format!("/tmp/ccswitch-opencode-usage-{}.db", std::process::id());
+        let mut writer = Command::new("wsl.exe")
+            .args(["--distribution", &distro, "--exec", "python3", "-u", "-c"])
+            .arg(
+                r#"import sqlite3,sys,os
+p=sys.argv[1]
+c=sqlite3.connect(p,isolation_level=None)
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY,title TEXT,directory TEXT,time_created INTEGER,time_updated INTEGER)')
+c.execute('CREATE TABLE session_message (id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT)')
+c.execute("INSERT INTO session_v2 VALUES('ses_wsl','WSL usage','/tmp/project',100,200)")
+c.execute("INSERT INTO session_message VALUES('msg_wsl','ses_wsl','assistant',1,100,200,?)",('{"tokens":{"input":100,"output":20},"model":{"id":"wsl-model"},"time":{"created":100,"completed":200},"content":[{"type":"text","text":"wsl usage answer"}]}',))
+print('ready',flush=True)
+for action in sys.stdin:
+    action=action.strip()
+    if action=='exit': break
+    print(action,flush=True)
+c.close()
+for suffix in ('','-wal','-shm'):
+    try: os.unlink(p+suffix)
+    except FileNotFoundError: pass
+"#,
+            )
+            .arg(&native_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("WSL Python writer");
+        let mut output = BufReader::new(writer.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+
+        let unc = std::path::PathBuf::from(format!(
+            r"\\wsl.localhost\{}{}",
+            distro,
+            native_path.replace('/', "\\")
+        ));
+        let db = Database::memory().unwrap();
+        let result = sync_opencode_usage_from_path(&db, &unc).unwrap();
+        assert_eq!(result.imported, 1);
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            imported_request_ids(&db),
+            vec!["opencode_session:ses_wsl:msg_wsl"]
+        );
+
+        // The unchanged WAL-backed database must not import the same row again.
+        assert_eq!(
+            sync_opencode_usage_from_path(&db, &unc).unwrap().imported,
+            0
+        );
+
+        writeln!(writer.stdin.as_mut().unwrap(), "exit").unwrap();
+        assert!(writer.wait().unwrap().success());
     }
 }
