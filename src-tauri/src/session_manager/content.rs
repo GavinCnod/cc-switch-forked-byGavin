@@ -467,6 +467,24 @@ fn read_sqlite_cell(
         return Err("不支持的内容引用".to_string());
     }
     #[cfg(windows)]
+    if provider_id == "opencode" && crate::session_manager::opencode_wsl::is_wsl(db) {
+        return crate::session_manager::opencode_wsl::read_cell(
+            db,
+            session_id,
+            table,
+            id,
+            column,
+            MAX_TEXT_BYTES,
+        )
+        .map_err(|error| {
+            if error.contains("too large") {
+                TOO_LARGE_TEXT.to_string()
+            } else {
+                STALE.to_string()
+            }
+        });
+    }
+    #[cfg(windows)]
     if provider_id == "hermes" && crate::session_manager::hermes_wsl::is_wsl(db) {
         let value = crate::session_manager::hermes_wsl::read(
             db,

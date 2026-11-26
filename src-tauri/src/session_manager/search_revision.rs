@@ -41,6 +41,16 @@ impl SqliteRevisions {
         let SourceLocation::Sqlite { db, session_id } = &source.location else {
             return Err("Expected a SQLite session source".into());
         };
+        // Opening a WSL SQLite database from Windows is not lockable and may
+        // miss WAL data. Use the database/WAL file fingerprint for search index
+        // invalidation; it can re-read more sessions after a write, but never
+        // opens the database through the 9P share.
+        #[cfg(windows)]
+        if source.provider_id == "opencode" && crate::session_manager::opencode_wsl::is_wsl(db) {
+            return cache::fingerprint(&source.location)
+                .map(StoredFingerprint::from)
+                .map_err(|e| e.to_string());
+        }
         let result = (|| -> Result<StoredFingerprint, String> {
             if !self.databases.contains_key(db) {
                 let fingerprint =

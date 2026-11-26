@@ -12,17 +12,15 @@ use super::utils::{parse_timestamp_to_ms, path_basename, truncate_summary, ScanS
 
 const PROVIDER_ID: &str = "opencode";
 
-/// Return the OpenCode base directory (`$XDG_DATA_HOME/opencode`).
+/// Return the OpenCode base data directory.
 ///
-/// Respects `XDG_DATA_HOME` on all platforms; falls back to
-/// `~/.local/share/opencode/`.
+/// Path resolution is shared with the usage importer and the live config
+/// reader: `opencode_config::get_opencode_data_dir` honors the configured
+/// OpenCode directory, including a WSL UNC path on Windows. Keeping the
+/// resolution there avoids the config directory and the session/usage data
+/// directory drifting apart again.
 pub(crate) fn get_opencode_base_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("opencode");
-        }
-    }
-    crate::config::get_home_dir().join(".local/share/opencode")
+    crate::opencode_config::get_opencode_data_dir()
 }
 
 /// Return the OpenCode JSON storage directory (legacy flat-file layout).
@@ -172,19 +170,30 @@ pub(crate) fn parse_sqlite_source(source: &str) -> Option<(PathBuf, String)> {
     Some((db_path, session_id))
 }
 
-#[cfg(test)]
-fn scan_sessions_sqlite() -> Vec<SessionMeta> {
-    scan_sessions_sqlite_with_status(&mut ScanStatus::default())
+fn scan_sessions_sqlite_with_status(status: &mut ScanStatus) -> Vec<SessionMeta> {
+    scan_sessions_sqlite_at_with_status(&get_opencode_db_path(), status)
 }
 
-fn scan_sessions_sqlite_with_status(status: &mut ScanStatus) -> Vec<SessionMeta> {
-    let db_path = get_opencode_db_path();
-    if status.metadata(&db_path).is_none() {
+#[cfg(test)]
+fn scan_sessions_sqlite_at(db_path: &Path) -> Vec<SessionMeta> {
+    scan_sessions_sqlite_at_with_status(db_path, &mut ScanStatus::default())
+}
+
+fn scan_sessions_sqlite_at_with_status(
+    db_path: &Path,
+    status: &mut ScanStatus,
+) -> Vec<SessionMeta> {
+    #[cfg(windows)]
+    if crate::session_manager::opencode_wsl::is_wsl(db_path) {
+        return scan_sessions_wsl_with_status(db_path, status);
+    }
+
+    if status.metadata(db_path).is_none() {
         return Vec::new();
     }
 
     let conn = match Connection::open_with_flags(
-        &db_path,
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
@@ -209,22 +218,73 @@ fn scan_sessions_sqlite_with_status(status: &mut ScanStatus) -> Vec<SessionMeta>
     }
 }
 
+/// Scan sessions through the WSL reader. The Python side only returns raw rows;
+/// title fallback, V1/V2 merging, and `SessionMeta` construction stay here.
+#[cfg(windows)]
+fn scan_sessions_wsl_with_status(db_path: &Path, status: &mut ScanStatus) -> Vec<SessionMeta> {
+    let data = match crate::session_manager::opencode_wsl::read(
+        db_path,
+        serde_json::json!({ "operation": "scan_sessions" }),
+    ) {
+        Ok(data) => data,
+        Err(error) => {
+            log::warn!(
+                "Failed to scan OpenCode WSL database {}: {error}",
+                db_path.display()
+            );
+            status.incomplete = true;
+            return Vec::new();
+        }
+    };
+
+    let db_display = db_path.display().to_string();
+    let parse_rows = |key: &str| -> Vec<SessionMeta> {
+        data.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| session_meta_from_json(row, &db_display))
+            .collect()
+    };
+
+    let schema = data.get("schema").and_then(Value::as_str).unwrap_or("v1");
+    if schema == "v1" {
+        return parse_rows("v1");
+    }
+
+    let mut sessions = parse_rows("v2");
+    merge_v1_sessions(&mut sessions, parse_rows("v1"));
+    sessions
+}
+
 fn parse_sqlite_session_row(
     row: &rusqlite::Row<'_>,
     db_display: &str,
 ) -> rusqlite::Result<SessionMeta> {
-    let session_id: String = row.get(0)?;
-    let title: String = row.get(1)?;
-    let directory: String = row.get(2)?;
-    let created: i64 = row.get(3)?;
-    let updated: i64 = row.get(4)?;
+    Ok(session_meta_from_fields(
+        db_display,
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        Some(row.get(3)?),
+        Some(row.get(4)?),
+    ))
+}
 
+fn session_meta_from_fields(
+    db_display: &str,
+    session_id: String,
+    title: String,
+    directory: String,
+    created: Option<i64>,
+    updated: Option<i64>,
+) -> SessionMeta {
     let display_title = if title.trim().is_empty() {
         path_basename(&directory)
     } else {
         Some(title)
     };
-    Ok(SessionMeta {
+    SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         title: display_title.clone(),
@@ -234,11 +294,35 @@ fn parse_sqlite_session_row(
         } else {
             Some(directory)
         },
-        created_at: Some(created),
-        last_active_at: Some(updated),
+        created_at: created,
+        last_active_at: updated.or(created),
         source_path: Some(format!("sqlite:{db_display}:{session_id}")),
         resume_command: Some(format!("opencode -s {session_id}")),
-    })
+    }
+}
+
+#[cfg(windows)]
+fn session_meta_from_json(value: &Value, db_display: &str) -> Option<SessionMeta> {
+    let session_id = value.get("id")?.as_str()?.to_string();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let directory = value
+        .get("directory")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let number = |key: &str| value.get(key).and_then(Value::as_i64);
+    Some(session_meta_from_fields(
+        db_display,
+        session_id,
+        title,
+        directory,
+        number("time_created"),
+        number("last_active_at").or_else(|| number("time_updated")),
+    ))
 }
 
 fn scan_sessions_sqlite_v1(
@@ -313,39 +397,46 @@ fn scan_sessions_sqlite_v2(
             if let Some(rows) = status.record(
                 v1_stmt.query_map([cutoff_ts], |row| parse_sqlite_session_row(row, db_display)),
             ) {
-                let mut session_index_by_id: HashMap<String, usize> = sessions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (s.session_id.clone(), i))
-                    .collect();
-
-                for v1_meta in rows.filter_map(|row| status.record(row)) {
-                    if let Some(&idx) = session_index_by_id.get(&v1_meta.session_id) {
-                        if v1_meta.last_active_at > sessions[idx].last_active_at {
-                            let v2_title = sessions[idx].title.take();
-                            let v2_summary = sessions[idx].summary.take();
-                            let mut meta = v1_meta;
-                            if (meta.title.is_none()
-                                || meta.title
-                                    == path_basename(meta.project_dir.as_deref().unwrap_or("")))
-                                && v2_title.is_some()
-                            {
-                                meta.title = v2_title;
-                                meta.summary = v2_summary;
-                            }
-                            sessions[idx] = meta;
-                        }
-                    } else {
-                        session_index_by_id.insert(v1_meta.session_id.clone(), sessions.len());
-                        sessions.push(v1_meta);
-                    }
-                }
-                sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_at));
+                let v1_sessions = rows.filter_map(|row| status.record(row)).collect();
+                merge_v1_sessions(&mut sessions, v1_sessions);
             }
         }
     }
 
     sessions
+}
+
+/// Merge V1 sessions into the V2 list using the migration-era precedence:
+/// keep the newer copy, and retain the V2 title when the V1 copy only has the
+/// directory basename.
+fn merge_v1_sessions(sessions: &mut Vec<SessionMeta>, v1_sessions: Vec<SessionMeta>) {
+    let mut session_index_by_id: HashMap<String, usize> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.session_id.clone(), i))
+        .collect();
+
+    for v1_meta in v1_sessions {
+        if let Some(&idx) = session_index_by_id.get(&v1_meta.session_id) {
+            if v1_meta.last_active_at > sessions[idx].last_active_at {
+                let v2_title = sessions[idx].title.take();
+                let v2_summary = sessions[idx].summary.take();
+                let mut meta = v1_meta;
+                if (meta.title.is_none()
+                    || meta.title == path_basename(meta.project_dir.as_deref().unwrap_or("")))
+                    && v2_title.is_some()
+                {
+                    meta.title = v2_title;
+                    meta.summary = v2_summary;
+                }
+                sessions[idx] = meta;
+            }
+        } else {
+            session_index_by_id.insert(v1_meta.session_id.clone(), sessions.len());
+            sessions.push(v1_meta);
+        }
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_at));
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -428,6 +519,11 @@ fn read_json(path: &Path) -> Option<Value> {
 pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String> {
     let (db_path, session_id) = parse_sqlite_source(source)
         .ok_or_else(|| format!("Invalid SQLite source reference: {source}"))?;
+
+    #[cfg(windows)]
+    if crate::session_manager::opencode_wsl::is_wsl(&db_path) {
+        return load_messages_sqlite_wsl(&db_path, &session_id);
+    }
 
     let conn = Connection::open_with_flags(
         &db_path,
@@ -524,14 +620,16 @@ fn load_messages_sqlite_v1(
         )
         .map_err(|e| format!("Failed to prepare message query: {e}"))?;
 
-    let msg_rows = msg_stmt
+    let msg_rows: Vec<(String, i64, String)> = msg_stmt
         .query_map([session_id], |row| {
             let id: String = row.get(0)?;
             let ts: i64 = row.get(1)?;
             let data: String = row.get(2)?;
             Ok((id, ts, data))
         })
-        .map_err(|e| format!("Failed to query messages: {e}"))?;
+        .map_err(|e| format!("Failed to query messages: {e}"))?
+        .flatten()
+        .collect();
 
     let mut part_stmt = conn
         .prepare(
@@ -540,17 +638,26 @@ fn load_messages_sqlite_v1(
         )
         .map_err(|e| format!("Failed to prepare part query: {e}"))?;
 
-    let part_rows = part_stmt
+    let part_rows: Vec<(String, String, String)> = part_stmt
         .query_map([session_id], |row| {
             let part_id: String = row.get(0)?;
             let message_id: String = row.get(1)?;
             let data: String = row.get(2)?;
             Ok((part_id, message_id, data))
         })
-        .map_err(|e| format!("Failed to query parts: {e}"))?;
+        .map_err(|e| format!("Failed to query parts: {e}"))?
+        .flatten()
+        .collect();
 
+    Ok(build_messages_v1(msg_rows, part_rows))
+}
+
+fn build_messages_v1(
+    msg_rows: Vec<(String, i64, String)>,
+    part_rows: Vec<(String, String, String)>,
+) -> Vec<SessionMessage> {
     let mut parts_map: HashMap<String, Vec<(PartLocator, Value)>> = HashMap::new();
-    for (part_id, message_id, data) in part_rows.flatten() {
+    for (part_id, message_id, data) in part_rows {
         let Ok(part) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
@@ -566,7 +673,7 @@ fn load_messages_sqlite_v1(
     }
 
     let mut messages = Vec::new();
-    for (msg_id, ts, data) in msg_rows.flatten() {
+    for (msg_id, ts, data) in msg_rows {
         let Ok(msg_value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
@@ -582,7 +689,7 @@ fn load_messages_sqlite_v1(
     }
 
     assign_turn_ids(&mut messages);
-    Ok(messages)
+    messages
 }
 
 fn load_messages_sqlite_v2(
@@ -598,7 +705,7 @@ fn load_messages_sqlite_v2(
         )
         .map_err(|e| format!("Failed to prepare V2 message query: {e}"))?;
 
-    let rows = stmt
+    let rows: Vec<(String, String, i64, String)> = stmt
         .query_map([session_id], |row| {
             let id: String = row.get(0)?;
             let msg_type: String = row.get(1)?;
@@ -606,10 +713,16 @@ fn load_messages_sqlite_v2(
             let data: String = row.get(3)?;
             Ok((id, msg_type, ts, data))
         })
-        .map_err(|e| format!("Failed to query V2 messages: {e}"))?;
+        .map_err(|e| format!("Failed to query V2 messages: {e}"))?
+        .flatten()
+        .collect();
 
+    Ok(build_messages_v2(rows))
+}
+
+fn build_messages_v2(rows: Vec<(String, String, i64, String)>) -> Vec<SessionMessage> {
     let mut messages = Vec::new();
-    for (row_id, msg_type, ts, data) in rows.flatten() {
+    for (row_id, msg_type, ts, data) in rows {
         let Ok(msg_value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
@@ -666,7 +779,72 @@ fn load_messages_sqlite_v2(
     }
 
     assign_turn_ids(&mut messages);
-    Ok(messages)
+    messages
+}
+
+/// Load messages through the WSL reader and feed the same builders as the
+/// native path. The Python side only selects the layout and returns raw rows.
+#[cfg(windows)]
+fn load_messages_sqlite_wsl(
+    db_path: &Path,
+    session_id: &str,
+) -> Result<Vec<SessionMessage>, String> {
+    let data = crate::session_manager::opencode_wsl::read(
+        db_path,
+        serde_json::json!({
+            "operation": "load_messages",
+            "session_id": session_id,
+        }),
+    )?;
+    let layout = data
+        .get("layout")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Invalid OpenCode WSL message layout".to_string())?;
+
+    let array = |key: &str| -> Vec<&Value> {
+        data.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+
+    if layout == "v1" {
+        let msg_rows = array("messages")
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("id")?.as_str()?.to_string(),
+                    row.get("time_created").and_then(Value::as_i64)?,
+                    row.get("data")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let part_rows = array("parts")
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("id")?.as_str()?.to_string(),
+                    row.get("message_id")?.as_str()?.to_string(),
+                    row.get("data")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        Ok(build_messages_v1(msg_rows, part_rows))
+    } else {
+        let rows = array("messages")
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("id")?.as_str()?.to_string(),
+                    row.get("type")?.as_str()?.to_string(),
+                    row.get("time_created").and_then(Value::as_i64)?,
+                    row.get("data")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        Ok(build_messages_v2(rows))
+    }
 }
 
 pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
@@ -752,6 +930,11 @@ pub fn delete_session_sqlite(session_id: &str, source: &str) -> Result<bool, Str
     }
     if db_path != expected_db_path {
         return Err("SQLite path does not match expected OpenCode database".to_string());
+    }
+
+    #[cfg(windows)]
+    if crate::session_manager::opencode_wsl::is_wsl(&db_path) {
+        return crate::session_manager::opencode_wsl::delete_session(&db_path, session_id);
     }
 
     let conn =
@@ -1038,6 +1221,7 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVars;
     use rusqlite::Connection;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -1080,6 +1264,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn delete_session_removes_session_diff_messages_and_parts() {
         let temp = tempdir().expect("tempdir");
         let storage = temp.path();
@@ -1141,6 +1326,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_messages_includes_tool_parts() {
         let temp = tempdir().expect("tempdir");
         let storage = temp.path();
@@ -1178,6 +1364,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn parse_sqlite_source_accepts_valid_references() {
         let parsed = parse_sqlite_source("sqlite:/tmp/opencode.db:ses_123").expect("valid source");
 
@@ -1186,6 +1373,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn parse_sqlite_source_rejects_invalid_references() {
         assert!(parse_sqlite_source("/tmp/opencode.db:ses_123").is_none());
         assert!(parse_sqlite_source("sqlite:/tmp/opencode.db:msg_123").is_none());
@@ -1193,6 +1381,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn scan_sessions_sqlite_reads_temp_database() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1220,7 +1409,7 @@ mod tests {
         .expect("insert session 2");
         drop(conn);
 
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
 
         if let Some(value) = original_xdg {
             std::env::set_var("XDG_DATA_HOME", value);
@@ -1246,6 +1435,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_messages_sqlite_reads_messages_and_parts() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1312,6 +1502,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn delete_session_sqlite_removes_session() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1324,6 +1515,7 @@ mod tests {
         let base_dir = temp.path().join("opencode");
         std::fs::create_dir_all(&base_dir).expect("create base dir");
         let db_path = base_dir.join("opencode.db");
+        let _db_env = EnvVars::new().set("OPENCODE_DB", &db_path);
         let conn = Connection::open(&db_path).expect("open sqlite db");
         create_sqlite_schema(&conn);
 
@@ -1383,6 +1575,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn delete_session_sqlite_rejects_foreign_db_path() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1396,6 +1589,7 @@ mod tests {
         std::fs::create_dir_all(&expected_base_dir).expect("create expected base dir");
         let expected_db_path = expected_base_dir.join("opencode.db");
         Connection::open(&expected_db_path).expect("create expected sqlite db");
+        let _db_env = EnvVars::new().set("OPENCODE_DB", &expected_db_path);
 
         let db_path = temp.path().join("foreign.db");
         let conn = Connection::open(&db_path).expect("open sqlite db");
@@ -1445,6 +1639,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn scan_sessions_sqlite_v2_reads_temp_database() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1480,7 +1675,7 @@ mod tests {
         .expect("insert v2 message");
         drop(conn);
 
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
 
         if let Some(value) = original_xdg {
             std::env::set_var("XDG_DATA_HOME", value);
@@ -1498,6 +1693,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_messages_sqlite_v2_reads_messages() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1550,6 +1746,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn delete_session_sqlite_v2_removes_session() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1562,6 +1759,7 @@ mod tests {
         let base_dir = temp.path().join("opencode");
         std::fs::create_dir_all(&base_dir).expect("create base dir");
         let db_path = base_dir.join("opencode.db");
+        let _db_env = EnvVars::new().set("OPENCODE_DB", &db_path);
         let conn = Connection::open(&db_path).expect("open sqlite db");
         create_sqlite_schema_v2(&conn);
 
@@ -1608,6 +1806,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_messages_sqlite_v2_orders_by_seq_instead_of_time_created() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1658,6 +1857,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mixed_v1_v2_database_scans_loads_and_deletes_post_migration_v1_sessions() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
@@ -1670,6 +1870,7 @@ mod tests {
         let base_dir = temp.path().join("opencode");
         std::fs::create_dir_all(&base_dir).expect("create base dir");
         let db_path = base_dir.join("opencode.db");
+        let _db_env = EnvVars::new().set("OPENCODE_DB", &db_path);
         let conn = Connection::open(&db_path).expect("open sqlite db");
         create_sqlite_schema(&conn);
         create_sqlite_schema_v2(&conn);
@@ -1738,7 +1939,7 @@ mod tests {
         .expect("insert v1 part");
         drop(conn);
 
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "ses_v1_post");
         assert_eq!(sessions[0].title.as_deref(), Some("Post Migration 1.x"));
@@ -1786,6 +1987,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     #[allow(deprecated)]
     fn session_in_both_tables_continued_in_v1_reads_newer_v1_messages_and_meta() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
@@ -1856,7 +2058,7 @@ mod tests {
         drop(conn);
 
         // 1. scan_sessions_sqlite must report the newer V1 last_active_at (3000) and updated title
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "ses_both");
         assert_eq!(sessions[0].last_active_at, Some(3000));
@@ -1879,6 +2081,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     #[allow(deprecated)]
     fn session_in_both_tables_v1_metadata_update_only_preserves_newer_v2_messages() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
@@ -1959,7 +2162,7 @@ mod tests {
         drop(conn);
 
         // 1. scan_sessions_sqlite reports the newer metadata timestamp (3000)
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "ses_perm_update");
         assert_eq!(sessions[0].last_active_at, Some(3000));
@@ -1978,6 +2181,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     #[allow(deprecated)]
     fn interrupted_migration_incomplete_phase_does_not_hide_unmigrated_v1_sessions() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
@@ -2052,7 +2256,7 @@ mod tests {
         .expect("insert unmigrated part");
         drop(conn);
 
-        let sessions = scan_sessions_sqlite();
+        let sessions = scan_sessions_sqlite_at(&db_path);
         // Both sessions must be listed; ses_unmigrated must not be hidden; ses_migrated must not be duplicated
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "ses_migrated");
@@ -2075,5 +2279,100 @@ mod tests {
         } else {
             std::env::remove_var("XDG_DATA_HOME");
         }
+    }
+
+    /// Diagnostic reference only: requires a real Windows host and WSL2 distro.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn wsl2_live_wal_readonly_reference() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        let distro = std::env::var("CC_SWITCH_WSL_DISTRO").expect("WSL distro");
+        let native_path = format!("/tmp/ccswitch-opencode-{}.db", std::process::id());
+        let mut writer = Command::new("wsl.exe")
+            .args(["--distribution", &distro, "--exec", "python3", "-u", "-c"])
+            .arg(
+                r#"import sqlite3,sys,os
+p=sys.argv[1]
+c=sqlite3.connect(p,isolation_level=None)
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY,title TEXT,directory TEXT,time_created INTEGER,time_updated INTEGER)')
+c.execute('CREATE TABLE session_message (id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT)')
+c.execute("INSERT INTO session_v2 VALUES('ses_wsl','WSL session','/tmp/project',100,200)")
+c.execute("INSERT INTO session_message VALUES('msg_wsl','ses_wsl','assistant',1,100,200,?)",('{"tokens":{"input":10,"output":2},"model":{"id":"wsl-model"},"time":{"created":100,"completed":200},"content":[{"type":"text","text":"wsl answer"}]}',))
+print('ready',flush=True)
+for action in sys.stdin:
+    action=action.strip()
+    if action=='second':
+        c.execute("INSERT INTO session_message VALUES('msg_wsl_2','ses_wsl','assistant',2,200,300,?)",('{"tokens":{"input":3,"output":1},"model":{"id":"wsl-model"},"time":{"created":200,"completed":300},"content":[{"type":"text","text":"wsl second"}]}',))
+    elif action=='exit': break
+    print(action,flush=True)
+c.close()
+for suffix in ('','-wal','-shm'):
+    try: os.unlink(p+suffix)
+    except FileNotFoundError: pass
+"#,
+            )
+            .arg(&native_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("WSL Python writer");
+        let mut output = BufReader::new(writer.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+
+        let unc = PathBuf::from(format!(
+            r"\\wsl.localhost\{}{}",
+            distro,
+            native_path.replace('/', "\\")
+        ));
+        let sessions = scan_sessions_sqlite_at(&unc);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_wsl");
+        assert_eq!(sessions[0].title.as_deref(), Some("WSL session"));
+
+        let source = format!("sqlite:{}:ses_wsl", unc.display());
+        let messages = load_messages_sqlite(&source).expect("load WSL messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("wsl answer"));
+
+        let usage_sessions = crate::session_manager::opencode_wsl::read(
+            &unc,
+            serde_json::json!({ "operation": "usage_sessions" }),
+        )
+        .expect("usage sessions through WSL");
+        assert_eq!(usage_sessions["schema"].as_str(), Some("v2"));
+        assert_eq!(
+            usage_sessions["sessions"][0]["id"].as_str(),
+            Some("ses_wsl")
+        );
+
+        let usage_messages = crate::session_manager::opencode_wsl::read(
+            &unc,
+            serde_json::json!({
+                "operation": "usage_messages",
+                "schema": "v2",
+                "session_id": "ses_wsl",
+                "cutoff_ms": 0,
+            }),
+        )
+        .expect("usage messages through WSL");
+        assert_eq!(usage_messages["messages"].as_array().unwrap().len(), 1);
+
+        writeln!(writer.stdin.as_mut().unwrap(), "second").unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "second");
+        let messages = load_messages_sqlite(&source).expect("load WAL message");
+        assert_eq!(messages.len(), 2, "WAL write must be visible");
+
+        writeln!(writer.stdin.as_mut().unwrap(), "exit").unwrap();
+        assert!(writer.wait().unwrap().success());
     }
 }
